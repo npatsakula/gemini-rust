@@ -782,11 +782,22 @@ impl GeminiClient {
         self.build_url_with_suffix(&suffix)
     }
 
-    /// Build a URL for a batch operation
+    /// Build a URL for a batch operation.
+    ///
+    /// The `batches` collection requires resource names of the form
+    /// `batches/{id}`. A bare id is normalized to that form; an already
+    /// qualified name (containing a `/`) and the list sentinel (`"batches"`)
+    /// are passed through unchanged. Batch ids are URL-safe, so `name` is used
+    /// verbatim as the path with no percent-encoding.
     fn build_batch_url(&self, name: &str, action: Option<&str>) -> Result<Url, Error> {
+        let normalized = if name == "batches" || name.contains('/') {
+            name.to_string()
+        } else {
+            format!("batches/{name}")
+        };
         let suffix = action
-            .map(|a| format!("{name}:{a}"))
-            .unwrap_or_else(|| name.to_string());
+            .map(|a| format!("{normalized}:{a}"))
+            .unwrap_or(normalized);
         self.build_url_with_suffix(&suffix)
     }
 

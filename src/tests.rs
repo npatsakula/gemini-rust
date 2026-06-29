@@ -445,3 +445,138 @@ fn test_inlined_responses_defaults_when_absent() {
     let r: InlinedResponses = serde_json::from_str("{}").unwrap();
     assert!(r.inlined_responses.is_empty());
 }
+
+// ========== Batch lifecycle classification ==========
+// `state` is the authoritative lifecycle status; every terminal state must be
+// reachable. These exercise the pure classifier directly (no I/O).
+
+fn classify_operation(json: &str) -> crate::batch::handle::BatchOutcome {
+    use crate::batch::{handle::BatchStatus, model::BatchOperation};
+    let operation: BatchOperation = serde_json::from_str(json).unwrap();
+    BatchStatus::classify(&operation)
+}
+
+#[test]
+fn test_classify_cancelled_state_maps_to_cancelled() {
+    use crate::batch::handle::BatchOutcome;
+
+    // A cancelled batch completes with a CANCELLED error payload; `state` must
+    // still win, so this resolves to Cancelled rather than a generic failure.
+    let outcome = classify_operation(
+        r#"{
+            "name": "batches/abc",
+            "done": true,
+            "error": {"code": 1, "message": "Cancelled"},
+            "metadata": {"state": "BATCH_STATE_CANCELLED", "batchStats": {"requestCount": "2"}}
+        }"#,
+    );
+    assert!(matches!(outcome, BatchOutcome::Cancelled));
+}
+
+#[test]
+fn test_classify_expired_state_maps_to_expired() {
+    use crate::batch::handle::BatchOutcome;
+
+    let outcome = classify_operation(
+        r#"{
+            "name": "batches/abc",
+            "done": true,
+            "metadata": {"state": "BATCH_STATE_EXPIRED", "batchStats": {"requestCount": "2"}}
+        }"#,
+    );
+    assert!(matches!(outcome, BatchOutcome::Expired));
+}
+
+#[test]
+fn test_classify_failed_state_maps_to_failed() {
+    use crate::batch::handle::BatchOutcome;
+
+    let outcome = classify_operation(
+        r#"{
+            "name": "batches/abc",
+            "done": true,
+            "error": {"code": 3, "message": "boom"},
+            "metadata": {"state": "BATCH_STATE_FAILED", "batchStats": {"requestCount": "2"}}
+        }"#,
+    );
+    assert!(matches!(outcome, BatchOutcome::Failed(_)));
+}
+
+#[test]
+fn test_classify_pending_state_maps_to_pending() {
+    use crate::batch::handle::BatchOutcome;
+
+    let outcome = classify_operation(
+        r#"{"name": "batches/abc", "done": false, "metadata": {"state": "BATCH_STATE_PENDING"}}"#,
+    );
+    assert!(matches!(outcome, BatchOutcome::Pending));
+}
+
+#[test]
+fn test_classify_running_state_reports_counts() {
+    use crate::batch::handle::BatchOutcome;
+    use crate::BatchStatus;
+
+    let outcome = classify_operation(
+        r#"{
+            "name": "batches/abc",
+            "done": false,
+            "metadata": {
+                "state": "BATCH_STATE_RUNNING",
+                "batchStats": {
+                    "requestCount": "5",
+                    "pendingRequestCount": "3",
+                    "successfulRequestCount": "1",
+                    "failedRequestCount": "1"
+                }
+            }
+        }"#,
+    );
+    match outcome {
+        BatchOutcome::Running(BatchStatus::Running {
+            pending_count,
+            completed_count,
+            failed_count,
+            total_count,
+        }) => {
+            assert_eq!(total_count, 5);
+            assert_eq!(pending_count, 3);
+            assert_eq!(completed_count, 1);
+            assert_eq!(failed_count, 1);
+        }
+        _ => panic!("expected Running outcome"),
+    }
+}
+
+#[test]
+fn test_classify_succeeded_state_signals_success() {
+    use crate::batch::handle::BatchOutcome;
+
+    // Result extraction is deferred (it may require I/O), so success only needs
+    // the state to be recognized here.
+    let outcome = classify_operation(
+        r#"{
+            "name": "batches/abc",
+            "done": true,
+            "metadata": {"state": "BATCH_STATE_SUCCEEDED", "batchStats": {"requestCount": "2"}}
+        }"#,
+    );
+    assert!(matches!(outcome, BatchOutcome::Succeeded));
+}
+
+#[test]
+fn test_classify_done_with_error_falls_back_to_failed() {
+    use crate::batch::handle::BatchOutcome;
+
+    // State not yet terminal, but the LRO is done with an error: must not be
+    // reported as Pending forever.
+    let outcome = classify_operation(
+        r#"{
+            "name": "batches/abc",
+            "done": true,
+            "error": {"code": 13, "message": "internal"},
+            "metadata": {"state": "BATCH_STATE_UNSPECIFIED"}
+        }"#,
+    );
+    assert!(matches!(outcome, BatchOutcome::Failed(_)));
+}

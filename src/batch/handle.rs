@@ -64,7 +64,7 @@
 //! }
 //! ```
 
-use snafu::{OptionExt, ResultExt, Snafu};
+use snafu::{IntoError, OptionExt, ResultExt, Snafu};
 use std::{result::Result, sync::Arc};
 
 use super::model::*;
@@ -228,58 +228,110 @@ impl BatchStatus {
         operation: BatchOperation,
         client: Arc<GeminiClient>,
     ) -> Result<Self, Error> {
-        if operation.done {
-            // According to Google API documentation, when done=true, result must be present
-            let result = operation.result.context(MissingResultSnafu {
-                name: operation.name.clone(),
-            })?;
+        match Self::classify(&operation) {
+            BatchOutcome::Pending => Ok(BatchStatus::Pending),
+            BatchOutcome::Running(status) => Ok(status),
+            BatchOutcome::Cancelled => Ok(BatchStatus::Cancelled),
+            BatchOutcome::Expired => Ok(BatchStatus::Expired),
+            BatchOutcome::Failed(error) => Err(error),
+            // Only the success path needs to fetch/parse results (I/O).
+            BatchOutcome::Succeeded => Self::succeeded(operation, client).await,
+        }
+    }
 
-            let response = Result::from(result).context(BatchFailedSnafu {
-                name: operation.name,
-            })?;
-
-            let mut results = Self::process_successful_response(response, client).await?;
-            results.sort_by_key(|r| r.meta.key);
-
-            // Handle terminal states based on metadata for edge cases
-            match operation.metadata.state {
-                BatchState::BatchStateCancelled => Ok(BatchStatus::Cancelled),
-                BatchState::BatchStateExpired => Ok(BatchStatus::Expired),
-                _ => Ok(BatchStatus::Succeeded { results }),
-            }
-        } else {
-            // The operation is still in progress.
-            match operation.metadata.state {
-                BatchState::BatchStatePending => Ok(BatchStatus::Pending),
-                BatchState::BatchStateRunning => {
-                    let total_count = operation.metadata.batch_stats.request_count;
-                    let pending_count = operation
-                        .metadata
-                        .batch_stats
-                        .pending_request_count
-                        .unwrap_or(total_count);
-                    let completed_count = operation
-                        .metadata
-                        .batch_stats
-                        .successful_request_count
-                        .unwrap_or(0);
-                    let failed_count = operation
-                        .metadata
-                        .batch_stats
-                        .failed_request_count
-                        .unwrap_or(0);
-                    Ok(BatchStatus::Running {
-                        pending_count,
-                        completed_count,
-                        failed_count,
-                        total_count,
-                    })
+    /// Maps an operation to a lifecycle outcome using `state` as the
+    /// authoritative status, as the API specifies. The LRO `done`/`result`
+    /// fields are only consulted as a fallback when `state` is not yet
+    /// meaningful, so every terminal status remains reachable. This is pure
+    /// (no I/O) so the lifecycle transitions can be unit-tested directly.
+    pub(crate) fn classify(operation: &BatchOperation) -> BatchOutcome {
+        match operation.metadata.state {
+            BatchState::BatchStateSucceeded => BatchOutcome::Succeeded,
+            BatchState::BatchStateFailed => BatchOutcome::Failed(Self::failure(operation)),
+            BatchState::BatchStateCancelled => BatchOutcome::Cancelled,
+            BatchState::BatchStateExpired => BatchOutcome::Expired,
+            BatchState::BatchStateRunning => BatchOutcome::Running(Self::running(operation)),
+            // State isn't terminal. Honor LRO completion as a fallback so a
+            // finished operation whose state is under-specified still resolves
+            // rather than reporting Pending forever.
+            BatchState::BatchStatePending | BatchState::BatchStateUnspecified => {
+                match (operation.done, &operation.result) {
+                    (true, Some(OperationResult::Error(_))) => {
+                        BatchOutcome::Failed(Self::failure(operation))
+                    }
+                    (true, Some(OperationResult::Response(_))) => BatchOutcome::Succeeded,
+                    _ => BatchOutcome::Pending,
                 }
-                // For non-running states when done=false, treat as pending
-                _ => Ok(BatchStatus::Pending),
             }
         }
     }
+
+    /// Extracts and sorts results from a completed, successful operation.
+    async fn succeeded(
+        operation: BatchOperation,
+        client: Arc<GeminiClient>,
+    ) -> Result<BatchStatus, Error> {
+        let result = operation.result.context(MissingResultSnafu {
+            name: operation.name.clone(),
+        })?;
+        let response = Result::from(result).context(BatchFailedSnafu {
+            name: operation.name,
+        })?;
+        let mut results = Self::process_successful_response(response, client).await?;
+        results.sort_by_key(|r| r.meta.key);
+        Ok(BatchStatus::Succeeded { results })
+    }
+
+    /// Builds a `BatchFailed` error, preferring the operation's own error
+    /// payload and synthesizing one when the API reports a failed state without
+    /// any error details.
+    fn failure(operation: &BatchOperation) -> Error {
+        let source = match &operation.result {
+            Some(OperationResult::Error(error)) => OperationError {
+                code: error.code,
+                message: error.message.clone(),
+            },
+            _ => OperationError {
+                code: -1,
+                message: "batch reported a FAILED state without error details".to_string(),
+            },
+        };
+        BatchFailedSnafu {
+            name: operation.name.clone(),
+        }
+        .into_error(source)
+    }
+
+    /// Builds the in-progress `Running` status from the batch statistics.
+    fn running(operation: &BatchOperation) -> BatchStatus {
+        let stats = &operation.metadata.batch_stats;
+        let total_count = stats.request_count;
+        BatchStatus::Running {
+            pending_count: stats.pending_request_count.unwrap_or(total_count),
+            completed_count: stats.successful_request_count.unwrap_or(0),
+            failed_count: stats.failed_request_count.unwrap_or(0),
+            total_count,
+        }
+    }
+}
+
+/// The lifecycle outcome of a batch operation, derived purely from its state.
+///
+/// `Succeeded` indicates results are available but still need to be fetched and
+/// parsed by the caller; every other variant is fully resolved.
+pub(crate) enum BatchOutcome {
+    /// Waiting to be processed.
+    Pending,
+    /// Currently processing, carrying the populated [`BatchStatus::Running`].
+    Running(BatchStatus),
+    /// Completed successfully; results still need to be extracted.
+    Succeeded,
+    /// Cancelled by the user.
+    Cancelled,
+    /// Expired before completion.
+    Expired,
+    /// Failed, carrying the error to surface from `status()`.
+    Failed(Error),
 }
 
 /// Represents a long-running batch operation, providing methods to manage its lifecycle.
@@ -287,7 +339,9 @@ impl BatchStatus {
 /// A `Batch` object is a handle to a batch operation on the Gemini API. It allows you to
 /// check the status, cancel the operation, or delete it once it's no longer needed.
 pub struct BatchHandle {
-    /// The unique resource name of the batch operation, e.g., `operations/batch-xxxxxxxx`.
+    /// The unique resource name of the batch operation, of the form
+    /// `batches/{id}` (as returned when the batch is created). This is the
+    /// value to pass to [`Gemini::get_batch`](crate::Gemini::get_batch).
     pub name: String,
     client: Arc<GeminiClient>,
 }
