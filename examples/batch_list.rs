@@ -54,7 +54,7 @@ async fn do_main() -> Result<(), Box<dyn std::error::Error>> {
                 info!(
                     batch_name = operation.name,
                     state = ?operation.metadata.state,
-                    created = %operation.metadata.create_time,
+                    created = ?operation.metadata.create_time,
                     "batch operation found"
                 );
             }

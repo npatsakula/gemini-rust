@@ -49,7 +49,8 @@ impl BatchBuilder {
 
     /// Constructs the final `BatchGenerateContentRequest` from the builder's configuration.
     ///
-    /// This method consumes the builder.
+    /// This method consumes the builder. The model is taken from the client the
+    /// builder was created from, so the resulting request is valid as-is.
     pub fn build(self) -> BatchGenerateContentRequest {
         let batch_requests: Vec<BatchRequestItem> = self
             .requests
@@ -64,6 +65,7 @@ impl BatchBuilder {
         BatchGenerateContentRequest {
             batch: BatchConfig {
                 display_name: self.display_name,
+                model: self.client.model.clone(),
                 input_config: InputConfig::Requests(RequestsContainer {
                     requests: batch_requests,
                 }),
@@ -127,6 +129,7 @@ impl BatchBuilder {
         let request = BatchGenerateContentRequest {
             batch: BatchConfig {
                 display_name: self.display_name,
+                model: self.client.model.clone(),
                 input_config: InputConfig::FileName(file.name().to_string()),
             },
         };

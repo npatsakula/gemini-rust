@@ -378,3 +378,70 @@ fn test_builder_safety_settings() {
     assert_eq!(req_settings.len(), 1);
     assert_eq!(req_settings[0].category, HarmCategory::Harassment);
 }
+
+// ========== Batch response decoding ==========
+// The Gemini API follows proto3 JSON conventions and omits empty/output-only
+// fields, and it has two layouts for completed results. These tests lock in
+// that our batch types tolerate both.
+
+#[test]
+fn test_list_batches_response_defaults_operations_when_absent() {
+    use crate::batch::model::ListBatchesResponse;
+
+    // An empty list body (`{}`) must decode to an empty operations list, since
+    // the API omits the array entirely rather than returning `[]`.
+    let resp: ListBatchesResponse = serde_json::from_str("{}").unwrap();
+    assert!(resp.operations.is_empty());
+    assert!(resp.next_page_token.is_none());
+}
+
+#[test]
+fn test_batch_metadata_decodes_with_only_state() {
+    use crate::batch::model::{BatchMetadata, BatchState};
+
+    // In-progress batch metadata may omit every output-only field except state.
+    let meta: BatchMetadata = serde_json::from_str(r#"{"state":"BATCH_STATE_PENDING"}"#).unwrap();
+    assert_eq!(meta.state, BatchState::BatchStatePending);
+    assert!(meta.create_time.is_none());
+    assert_eq!(meta.batch_stats.request_count, 0);
+}
+
+#[test]
+fn test_batch_operation_response_decodes_legacy_responses_file() {
+    use crate::batch::model::BatchOperationResponse;
+
+    // Legacy shape: the file reference sits at the top level.
+    let r: BatchOperationResponse =
+        serde_json::from_str(r#"{"responsesFile":"files/abc"}"#).unwrap();
+    match r {
+        BatchOperationResponse::ResponsesFile { responses_file } => {
+            assert_eq!(responses_file, "files/abc");
+        }
+        other => panic!("expected legacy ResponsesFile, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_batch_operation_response_decodes_nested_output() {
+    use crate::batch::model::BatchOperationResponse;
+
+    // Newer typed shape: the same data nested under `output`.
+    let r: BatchOperationResponse =
+        serde_json::from_str(r#"{"output":{"responsesFile":"files/abc"}}"#).unwrap();
+    match r {
+        BatchOperationResponse::Output { output } => {
+            assert_eq!(output.responses_file.as_deref(), Some("files/abc"));
+            assert!(output.inlined_responses.is_none());
+        }
+        other => panic!("expected nested Output, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_inlined_responses_defaults_when_absent() {
+    use crate::batch::model::InlinedResponses;
+
+    // Inlined response containers omit the array when there are no responses.
+    let r: InlinedResponses = serde_json::from_str("{}").unwrap();
+    assert!(r.inlined_responses.is_empty());
+}

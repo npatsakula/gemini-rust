@@ -148,6 +148,18 @@ pub enum BatchStatus {
 }
 
 impl BatchStatus {
+    /// Downloads and parses a result file identified by its resource name.
+    async fn parse_response_file_by_name(
+        responses_file: String,
+        client: Arc<GeminiClient>,
+    ) -> Result<Vec<BatchGenerationResponseItem>, Error> {
+        let file = crate::files::model::File {
+            name: responses_file,
+            ..Default::default()
+        };
+        Self::parse_response_file(file, client).await
+    }
+
     async fn parse_response_file(
         response_file: crate::files::model::File,
         client: Arc<GeminiClient>,
@@ -190,11 +202,23 @@ impl BatchStatus {
                 })
                 .collect(),
             BatchOperationResponse::ResponsesFile { responses_file } => {
-                let file = crate::files::model::File {
-                    name: responses_file,
-                    ..Default::default()
-                };
-                Self::parse_response_file(file, client).await?
+                Self::parse_response_file_by_name(responses_file, client).await?
+            }
+            BatchOperationResponse::Output { output } => {
+                if let Some(inlined) = output.inlined_responses {
+                    inlined
+                        .inlined_responses
+                        .into_iter()
+                        .map(|item| BatchGenerationResponseItem {
+                            response: item.result.into(),
+                            meta: item.metadata,
+                        })
+                        .collect()
+                } else if let Some(responses_file) = output.responses_file {
+                    Self::parse_response_file_by_name(responses_file, client).await?
+                } else {
+                    vec![]
+                }
             }
         };
         Ok(results)
@@ -237,7 +261,7 @@ impl BatchStatus {
                     let completed_count = operation
                         .metadata
                         .batch_stats
-                        .completed_request_count
+                        .successful_request_count
                         .unwrap_or(0);
                     let failed_count = operation
                         .metadata
